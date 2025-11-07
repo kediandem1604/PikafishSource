@@ -15,3 +15,23 @@ src/-lstdc++.res
 # Neural network for the NNUE evaluation
 **/*.nnue
 
+# VS build outputs
+win_dll/**/Debug/
+win_dll/**/Release/
+win_dll/**/*.ipch
+win_dll/**/*.pdb
+win_dll/**/*.dll
+win_dll/**/*.lib
+win_dll/**/*.exp
+win_dll/**/*.iobj
+win_dll/**/*.ipdb
+win_dll/**/*.obj
+win_dll/**/*.tlog/
+win_dll/.vs/
+# MinGW build outputs
+build_dll/
+# Binaries
+*.dll
+*.lib
+*.pdb
+*.exp
