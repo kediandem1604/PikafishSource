@@ -3,7 +3,7 @@
 #if defined(_WIN32)
   #define PIKA_API extern "C" __declspec(dllexport)
 #else
-  #define PIKA_API extern "C"
+  #define PIKA_API extern "C" __attribute__((visibility("default")))
 #endif
 
 // Callback kiểu phẳng
@@ -24,6 +24,7 @@ PIKA_API void pika_set_callbacks(pika_info_cb info_cb, pika_bestmove_cb bestmove
 PIKA_API void pika_emit_test_callbacks(void) noexcept;
 PIKA_API int  pika_get_callback_state(void) noexcept; // Returns: 0=none, 1=info only, 2=bestmove only, 3=both
 PIKA_API void pika_test_emit_from_thread(void) noexcept;
+PIKA_API void pika_clear_callbacks(void) noexcept;
 PIKA_API int  pika_global_init(void) noexcept;
 
 // Freeze-threads API: chỉ gọi ngay sau init

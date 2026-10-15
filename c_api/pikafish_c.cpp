@@ -122,35 +122,38 @@ namespace {
         }
     }
     
+    // Cache flag để tránh set callbacks nhiều lần không cần thiết
+    static std::atomic<bool> s_callbacks_installed{false};
+    
     // Helper nhẹ: chỉ gán callbacks, KHÔNG resize/không wait để tránh race
     static inline void EnsureEngineCallbacksInstalled(Stockfish::Engine& e) noexcept {
+        // Nếu đã set rồi, skip (trừ khi cần force reinstall)
+        if (s_callbacks_installed.load(std::memory_order_acquire)) {
+            return;
+        }
+        
         try {
-            push_info_msg("[native] EnsureEngineCallbacksInstalled: setting callbacks");
-            
             // Gán 5 callbacks public của Engine - đảm bảo KHÔNG callback nào là empty
             // Dùng static thunks thay vì OnInfo/OnBestMove để tránh scope issues
             e.set_on_update_no_moves(Thunk_OnInfoShort);
-            push_info_msg("[native] EnsureEngineCallbacksInstalled: set_on_update_no_moves OK");
-            
-            // set_on_update_full dùng InfoFull (có đầy đủ fields)
             e.set_on_update_full(Thunk_OnInfoFull);
             e.set_on_iter([](const Stockfish::Engine::InfoIter&) noexcept {});
             e.set_on_bestmove(Thunk_OnBestMove);
-            e.set_on_verify_networks([](std::string_view) noexcept {});
-            // Không resize ở đây: threads được freeze/resize tại pika_init_threads()
-            push_info_msg("[native] EnsureEngineCallbacksInstalled: callbacks set (no resize)");
+            // Pikafish 2026-09: gọi onStart() đầu mỗi lần search mà không kiểm tra rỗng → bắt buộc phải gán.
+            e.set_on_start([]() noexcept {});
+            e.set_on_verify_network([](std::string_view msg) noexcept {
+                // Lỗi nạp mạng NNUE: đẩy lên C# để có log (không còn exit(), xem nnue/network.cpp).
+                if (msg.rfind("ERROR", 0) == 0) {
+                    try { push_info_msg(std::string("[native] ").append(msg.substr(0, 200)).c_str()); } catch (...) {}
+                }
+            });
+            
+            // Mark đã install
+            s_callbacks_installed.store(true, std::memory_order_release);
         } catch (const std::bad_function_call&) {
-            push_info_msg("[native] EnsureEngineCallbacksInstalled ERROR: bad_function_call (callback empty during install)");
-        } catch (const std::exception& ex) {
-            try {
-                std::string msg = "[native] EnsureEngineCallbacksInstalled exception: ";
-                msg += ex.what();
-                push_info_msg(msg.c_str());
-            } catch (...) {
-                push_info_msg("[native] EnsureEngineCallbacksInstalled: exception formatting failed");
-            }
+            // Chỉ log error, không spam debug
         } catch (...) {
-            push_info_msg("[native] EnsureEngineCallbacksInstalled: unknown exception");
+            // Swallow exceptions để không làm chậm
         }
     }
     
@@ -158,41 +161,18 @@ namespace {
         // Clear message queue trước khi bắt đầu search mới
         pika_clear_messages();
         
-        push_info_msg("[native] SearchGo: thread started");
-        
         // CRITICAL: Bọc toàn bộ engine->go() trong try/catch để bắt mọi exception
         // bao gồm cả std::bad_function_call từ bên trong Engine
         try {
-            push_info_msg("[native] SearchGo: starting engine->go()");
-            
             // s_searching đã được set trong pika_go_* trước khi spawn thread
             engine->go(limit);
-            
-            push_info_msg("[native] SearchGo: engine->go() returned, waiting for finish");
             engine->wait_for_search_finished();
-            push_info_msg("[native] SearchGo: search completed successfully");
-        } catch (const std::bad_function_call& e) {
+        } catch (const std::bad_function_call&) {
             // Đây là exception chính gây crash - một std::function rỗng đã được gọi
-            try {
-                std::ostringstream oss;
-                oss << "[native] SearchGo ERROR: caught std::bad_function_call (empty std::function in engine). "
-                    << "This means Engine has an uninitialized callback that was called during search.";
-                push_info_msg(oss.str().c_str());
-            } catch (...) {
-                push_info_msg("[native] SearchGo ERROR: caught std::bad_function_call (failed to format)");
-            }
             push_bestmove_msg("", "");
-        } catch (const std::exception& ex) {
-            try {
-                std::string msg = "[native] SearchGo ERROR: std::exception: ";
-                msg += ex.what();
-                push_info_msg(msg.c_str());
-            } catch (...) {
-                push_info_msg("[native] SearchGo ERROR: failed to format exception message");
-            }
+        } catch (const std::exception&) {
             push_bestmove_msg("", "");
         } catch (...) {
-            push_info_msg("[native] SearchGo ERROR: unknown exception caught");
             push_bestmove_msg("", "");
         }
         s_searching.store(false, std::memory_order_release);
@@ -266,10 +246,12 @@ extern "C" int pika_init_threads(int threads) noexcept {
             e.get_options().setoption(iss);
         } catch (...) {}
         // Cài TRƯỚC để seed callback nếu engine copy trong resize
+        s_callbacks_installed.store(false, std::memory_order_release); // Force reinstall
         EnsureEngineCallbacksInstalled(e);
         // Resize ngay bây giờ
         e.resize_threads();
         // Cài SAU để đảm bảo worker mới có functor hợp lệ
+        s_callbacks_installed.store(false, std::memory_order_release); // Force reinstall
         EnsureEngineCallbacksInstalled(e);
         s_threads_frozen.store(true, std::memory_order_release);
         return 1;
@@ -326,7 +308,7 @@ extern "C" int pika_is_searching(void) noexcept {
 extern "C" int pika_global_init(void) noexcept {
     try {
         std::call_once(s_global_init, [](){
-            Stockfish::Bitboards::init();
+            Stockfish::Attacks::init();
             Stockfish::Position::init();
             // ... bổ sung các init toàn cục khác nếu có ...
             s_inited = true;
@@ -347,6 +329,8 @@ extern "C" int pika_init(void) noexcept {
         
         // Set tất cả callbacks lần đầu (không resize ở đây để tránh race sớm)
         EnsureEngineCallbacksInstalled(*s_engine);
+        // Reset flag khi init lại để đảm bảo callbacks được set lại
+        s_callbacks_installed.store(true, std::memory_order_release);
         return 1;
     } catch (...) {
         return -1;
@@ -389,28 +373,59 @@ extern "C" int pika_position_fen(const char* fen, const char* moves_csv) noexcep
     try {
         std::lock_guard<std::mutex> lk(s_mutex);
         if (!s_engine) return 0;
+        
+        // Tối ưu: chỉ parse moves nếu có
         std::vector<std::string> moves;
         if (moves_csv && moves_csv[0] != '\0') {
-            std::string s(moves_csv);
-            size_t start = 0, end;
-            while ((end = s.find(',', start)) != std::string::npos) {
-                auto mv = s.substr(start, end - start);
-                // Trim whitespace
-                mv.erase(0, mv.find_first_not_of(" \t\r\n"));
-                mv.erase(mv.find_last_not_of(" \t\r\n") + 1);
-                if (!mv.empty())
-                    moves.emplace_back(std::move(mv));
-                start = end + 1;
+            moves.reserve(64); // Pre-allocate để tránh reallocation
+            const char* p = moves_csv;
+            const char* start = p;
+            
+            // Parse nhanh hơn bằng cách scan trực tiếp thay vì dùng find
+            while (*p) {
+                if (*p == ',') {
+                    // Extract move
+                    size_t len = p - start;
+                    if (len > 0) {
+                        // Trim leading whitespace
+                        while (len > 0 && (*start == ' ' || *start == '\t' || *start == '\r' || *start == '\n')) {
+                            start++;
+                            len--;
+                        }
+                        // Trim trailing whitespace
+                        while (len > 0 && (start[len-1] == ' ' || start[len-1] == '\t' || start[len-1] == '\r' || start[len-1] == '\n')) {
+                            len--;
+                        }
+                        if (len > 0) {
+                            moves.emplace_back(start, len);
+                        }
+                    }
+                    start = ++p;
+                } else {
+                    p++;
+                }
             }
-            if (start < s.length()) {
-                auto mv = s.substr(start);
-                mv.erase(0, mv.find_first_not_of(" \t\r\n"));
-                mv.erase(mv.find_last_not_of(" \t\r\n") + 1);
-                if (!mv.empty())
-                    moves.emplace_back(std::move(mv));
+            // Last move
+            if (p > start) {
+                size_t len = p - start;
+                while (len > 0 && (*start == ' ' || *start == '\t' || *start == '\r' || *start == '\n')) {
+                    start++;
+                    len--;
+                }
+                while (len > 0 && (start[len-1] == ' ' || start[len-1] == '\t' || start[len-1] == '\r' || start[len-1] == '\n')) {
+                    len--;
+                }
+                if (len > 0) {
+                    moves.emplace_back(start, len);
+                }
             }
         }
-        s_engine->set_position(std::string(fen ? fen : "startpos"), moves);
+        
+        // Pikafish 2026-09 trả lỗi thay vì bỏ qua FEN / nước đi sai: báo lên C# và giữ nguyên thế cờ cũ.
+        if (auto err = s_engine->set_position(std::string(fen ? fen : "startpos"), moves)) {
+            push_info_msg((std::string("[native] invalid position: ") + err->what()).c_str());
+            return -3;
+        }
         return 1;
     } catch (...) {
         return -1;
@@ -421,28 +436,38 @@ extern "C" int pika_go_movetime(int ms) noexcept {
     try {
         std::thread old;
         Stockfish::Search::LimitsType limit;
-        limit.movetime = ms;
+        // IMPORTANT: startTime phải được set để TimeManagement::elapsed() hoạt động đúng.
+        // Nếu để mặc định 0, elapsed = now() - 0 sẽ rất lớn và movetime sẽ bị coi là đã hết ngay lập tức.
+        limit.startTime = Stockfish::now();   // Bắt đầu search từ thời điểm hiện tại
+        limit.movetime  = ms;                 // Thời gian tối đa cho lượt search này (millisecond)
         
         {
             std::lock_guard<std::mutex> lk(s_mutex);
-            if (!s_engine || s_searching.load()) return 0;
+            if (!s_engine) return 0;
+            
+            // Nếu đang search, stop thread cũ trước
+            if (s_searching.load()) {
+                s_engine->stop();
+                s_searching.store(false, std::memory_order_release);
+            }
+            
             if (s_search_thread.joinable())
                 old = std::move(s_search_thread);
         }
         
-        // Join old thread ngoài lock để tránh deadlock
-        if (old.joinable())
+        // Join thread cũ với timeout ngắn
+        if (old.joinable()) {
+            {
+                std::lock_guard<std::mutex> lk(s_mutex);
+                if (s_engine) s_engine->stop();
+            }
             old.join();
-        
-        push_info_msg("[native] pika_go_movetime: callbacks ready, installing to engine");
+        }
         
         EnsureEngineCallbacksInstalled(*s_engine);
         if (!s_threads_frozen.load(std::memory_order_acquire)) {
-            push_info_msg("[native] pika_go_movetime ERROR: threads not frozen (call pika_init_threads first)");
             return -2;
         }
-        
-        push_info_msg("[native] pika_go_movetime: spawning search thread (about to create thread)");
         
         // Spawn search thread
         {
@@ -470,24 +495,33 @@ extern "C" int pika_go_depth(int depth) noexcept {
         
         {
             std::lock_guard<std::mutex> lk(s_mutex);
-            if (!s_engine || s_searching.load()) return 0;
+            if (!s_engine) return 0;
+            
+            // Nếu đang search, stop thread cũ trước
+            if (s_searching.load()) {
+                s_engine->stop();
+                s_searching.store(false, std::memory_order_release);
+            }
+            
             if (s_search_thread.joinable())
                 old = std::move(s_search_thread);
         }
         
-        if (old.joinable())
+        // Join thread cũ với timeout ngắn - nếu quá lâu thì detach
+        if (old.joinable()) {
+            // Stop engine trước để thread cũ kết thúc nhanh
+            {
+                std::lock_guard<std::mutex> lk(s_mutex);
+                if (s_engine) s_engine->stop();
+            }
+            // Join nhanh - thread sẽ kết thúc ngay sau khi stop
             old.join();
-        
-        // Debug log
-        push_info_msg("[native] pika_go_depth: callbacks ready, installing to engine");
+        }
         
         EnsureEngineCallbacksInstalled(*s_engine);
         if (!s_threads_frozen.load(std::memory_order_acquire)) {
-            push_info_msg("[native] pika_go_depth ERROR: threads not frozen (call pika_init_threads first)");
             return -2;
         }
-        
-        push_info_msg("[native] pika_go_depth: spawning search thread");
         
         // Spawn search thread
         {
@@ -522,14 +556,10 @@ extern "C" int pika_go_infinite(void) noexcept {
         if (old.joinable())
             old.join();
         
-        push_info_msg("[native] pika_go_infinite: callbacks ready, installing to engine");
         EnsureEngineCallbacksInstalled(*s_engine);
         if (!s_threads_frozen.load(std::memory_order_acquire)) {
-            push_info_msg("[native] pika_go_infinite ERROR: threads not frozen (call pika_init_threads first)");
             return -2;
         }
-        
-        push_info_msg("[native] pika_go_infinite: spawning search thread");
         
         // Spawn search thread
         {
@@ -730,5 +760,16 @@ extern "C" void pika_test_emit_from_thread(void) noexcept {
         }).detach();
     } catch (...) {
         EmitInfo("[native] pika_test_emit_from_thread ERROR: failed to spawn test thread");
+    }
+}
+
+// Clear callbacks để ngăn thread test/engine gọi vào delegate đã bị unload
+extern "C" void pika_clear_callbacks() noexcept {
+    try {
+        s_cb_ready.store(false, std::memory_order_release);
+        s_info_cb.store(noop_info, std::memory_order_release);
+        s_bestmove_cb.store(noop_bestmove, std::memory_order_release);
+    } catch (...) {
+        // Swallow exception để không ném ra ngoài DLL
     }
 }
